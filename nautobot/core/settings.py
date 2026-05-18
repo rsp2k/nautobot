@@ -647,12 +647,13 @@ INSTALLED_APPS = [
 # `nautobot-server procrastinate <subcommand>` management commands. We only
 # add it if the optional extra is installed. Sites that stay on Celery don't
 # need this; sites that set NAUTOBOT_TASK_BACKEND=procrastinate require it.
-try:
-    import procrastinate  # noqa: F401  # presence check only
-except ImportError:
-    pass
-else:
+# Using find_spec rather than `import procrastinate` to avoid leaking the
+# module into the settings namespace (some introspection-based tests walk it).
+import importlib.util as _importlib_util
+
+if _importlib_util.find_spec("procrastinate") is not None:
     INSTALLED_APPS.append("procrastinate.contrib.django")
+del _importlib_util
 
 # Middleware
 MIDDLEWARE = [
@@ -1053,6 +1054,13 @@ CONTENT_TYPE_CACHE_TIMEOUT = int(os.getenv("NAUTOBOT_CONTENT_TYPE_CACHE_TIMEOUT"
 # Custom backends may be supplied as a dotted import path to a TaskBackend subclass.
 # See nautobot/docs/fork/procrastinate/ for the design overview.
 TASK_BACKEND = os.getenv("NAUTOBOT_TASK_BACKEND", "celery")
+
+# Procrastinate analogue of CELERY_TASK_ALWAYS_EAGER. When True (and the
+# active TASK_BACKEND is procrastinate), ProcrastinateBackend.enqueue()
+# short-circuits to enqueue_sync() and runs the job inline instead of
+# deferring to a worker. Primarily used by the test suite; production sites
+# should leave this False so jobs actually queue.
+PROCRASTINATE_ALWAYS_EAGER = is_truthy(os.getenv("NAUTOBOT_PROCRASTINATE_ALWAYS_EAGER", "False"))
 
 #
 # Celery (used for background processing when TASK_BACKEND == "celery")

@@ -46,6 +46,11 @@ CELERY_TASK_ALWAYS_EAGER = True
 CELERY_TASK_STORE_EAGER_RESULT = True
 CELERY_BROKER_URL = "memory://"
 
+# Procrastinate equivalent of CELERY_TASK_ALWAYS_EAGER: short-circuit
+# ProcrastinateBackend.enqueue() to run inline instead of deferring to a
+# worker. Only consulted when TASK_BACKEND=procrastinate; otherwise inert.
+PROCRASTINATE_ALWAYS_EAGER = True
+
 # Metrics need to enabled in this config as overriding them with override_settings will not actually enable them
 METRICS_ENABLED = True
 

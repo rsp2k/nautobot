@@ -8,7 +8,11 @@ class NautobotDatabaseHandler(logging.Handler):
     """Custom logging handler to log messages to JobLogEntry database entries."""
 
     def emit(self, record):
-        if current_task is None:
+        # Under Celery, current_task is the active Task instance and record.task_id
+        # is set automatically by Celery's logger. Under other backends
+        # (e.g., Procrastinate), current_task is None, but the backend
+        # injects record.task_id via a logging filter. Allow either path.
+        if current_task is None and not hasattr(record, "task_id"):
             return
 
         # Skip recording the log entry if it has been marked as such

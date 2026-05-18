@@ -18,9 +18,10 @@ that it stays inexpensive to import.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
 from uuid import UUID
 
 if TYPE_CHECKING:
@@ -83,6 +84,55 @@ def open_branch_context(options: "EnqueueOptions") -> "BranchContext":
         user=user,
         using=["default", JOB_LOGS],
     )
+
+
+class _TaskIdFilter(logging.Filter):
+    """Inject ``task_id`` onto log records that don't already have it.
+
+    Under Celery, ``celery.utils.log.TaskFormatter`` attaches ``task_id`` to
+    log records automatically because Celery's task wrapper installs the
+    context. Under Procrastinate there's no equivalent, so we inject it via
+    this filter only while a job is running.
+    """
+
+    def __init__(self, task_id: str) -> None:
+        super().__init__()
+        self.task_id = task_id
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        if not hasattr(record, "task_id"):
+            record.task_id = self.task_id
+        return True
+
+
+@contextlib.contextmanager
+def task_id_log_context(task_id: str) -> "Iterator[None]":
+    """Temporarily attach a TaskIdFilter to the ``NautobotDatabaseHandler``
+    so log records emitted during a Procrastinate-driven job carry ``task_id``.
+
+    Python logging filters added to a *logger* only apply to records emitted
+    directly at that logger — not to records propagated from child loggers.
+    To affect every record reaching the database handler regardless of which
+    child logger emitted it, we attach the filter to the *handler* itself.
+
+    ``NautobotDatabaseHandler.emit`` reads ``record.task_id`` to look up the
+    JobResult. Without this filter, Procrastinate-driven jobs would log
+    successfully but no ``JobLogEntry`` rows would appear.
+    """
+    from celery.utils.log import get_logger
+
+    from nautobot.core.celery.log import NautobotDatabaseHandler
+
+    task_logger = get_logger("celery.task")
+    db_handlers = [h for h in task_logger.handlers if isinstance(h, NautobotDatabaseHandler)]
+    flt = _TaskIdFilter(task_id)
+    for h in db_handlers:
+        h.addFilter(flt)
+    try:
+        yield
+    finally:
+        for h in db_handlers:
+            h.removeFilter(flt)
 
 
 def ensure_job_log_handler_attached() -> None:

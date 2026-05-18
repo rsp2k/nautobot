@@ -12,7 +12,7 @@ from dataclasses import FrozenInstanceError, is_dataclass
 from unittest import mock
 from uuid import UUID, uuid4
 
-from django.test import SimpleTestCase, override_settings
+from django.test import SimpleTestCase, TransactionTestCase, override_settings
 
 from nautobot.core.task_backends import (
     DispatchResult,
@@ -435,6 +435,53 @@ class MakeJobRequestTests(SimpleTestCase):
         self.assertEqual(req.properties["nautobot_job_branch_name"], "dev")
 
 
+class ProcrastinateAlwaysEagerDispatchTests(SimpleTestCase):
+    """Verify that PROCRASTINATE_ALWAYS_EAGER routes enqueue() to enqueue_sync().
+
+    This is the Celery-ALWAYS_EAGER analogue. Without it, tests that trigger
+    jobs under TASK_BACKEND=procrastinate would hang waiting for a worker.
+    """
+
+    def test_eager_mode_redirects_to_enqueue_sync(self):
+        backend = ProcrastinateBackend()
+        job_result_id = uuid4()
+        options = EnqueueOptions(user_id=uuid4(), job_model_id=uuid4())
+
+        with mock.patch.object(backend, "enqueue_sync") as mock_sync, override_settings(
+            PROCRASTINATE_ALWAYS_EAGER=True
+        ):
+            backend.enqueue(
+                job_result_id=job_result_id,
+                job_class_path="x.y.Z",
+                args=[],
+                kwargs={},
+                options=options,
+            )
+        mock_sync.assert_called_once()
+        # Verify it didn't also try to load the procrastinate app for defer().
+        self.assertIsNone(backend._app)
+
+    def test_default_mode_defers_to_procrastinate(self):
+        backend = ProcrastinateBackend()
+        # The test settings enable PROCRASTINATE_ALWAYS_EAGER (so suite-wide
+        # tests don't hang on a missing worker), but here we need to exercise
+        # the non-eager path: explicitly turn it off and mock the task to
+        # avoid actually hitting PostgreSQL.
+        with override_settings(PROCRASTINATE_ALWAYS_EAGER=False), mock.patch.object(
+            ProcrastinateBackend, "_get_task"
+        ) as mock_get_task:
+            mock_task = mock.MagicMock()
+            mock_get_task.return_value = mock_task
+            backend.enqueue(
+                job_result_id=uuid4(),
+                job_class_path="x.y.Z",
+                args=[],
+                kwargs={},
+                options=EnqueueOptions(user_id=uuid4(), job_model_id=uuid4()),
+            )
+        mock_task.defer.assert_called_once()
+
+
 class EnsureJobLogHandlerAttachedTests(SimpleTestCase):
     """The handler attachment must be idempotent so repeated calls (e.g. one
     per Procrastinate job) don't pile up duplicates on the same logger.
@@ -458,4 +505,78 @@ class EnsureJobLogHandlerAttachedTests(SimpleTestCase):
             len(nautobot_handlers),
             1,
             f"Expected exactly 1 NautobotDatabaseHandler after 3 calls; got {len(nautobot_handlers)}",
+        )
+
+
+@override_settings(TASK_BACKEND="procrastinate", PROCRASTINATE_ALWAYS_EAGER=True)
+class ProcrastinateBackendEndToEndTests(TransactionTestCase):
+    # JobLogEntry writes use the separate 'job_logs' database alias.
+    databases = ("default", "job_logs")
+
+    """End-to-end dispatch test: a real Nautobot Job, executed through
+    JobResult.enqueue_job under TASK_BACKEND=procrastinate, with
+    PROCRASTINATE_ALWAYS_EAGER short-circuiting to inline execution.
+
+    Verifies the full bridging:
+      - get_task_backend() resolves to ProcrastinateBackend
+      - enqueue() short-circuits to enqueue_sync() under eager mode
+      - The full lifecycle runs (before_start -> run -> on_success ->
+        after_return) — `TestPassJob` raises if any of those see wrong values
+      - JobResult ends up in STATUS_SUCCESS with date_done set
+      - JobLogEntry rows are captured
+
+    Mirrors the spirit of JobResultEnqueueJobCase but on the Procrastinate
+    path.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Backend resolution is cached. Settings are overridden at class level
+        # but the cache may carry a Celery instance from earlier tests.
+        get_task_backend.cache_clear()
+        # Import inside setUp to avoid model imports at module load time.
+        from django.contrib.auth import get_user_model
+
+        from nautobot.extras.models.jobs import Job
+
+        User = get_user_model()
+        self.user, _ = User.objects.get_or_create(username="procrastinate-e2e-test")
+        self.job_model = Job.objects.get_for_class_path("pass_job.TestPassJob")
+        self.job_model.enabled = True
+        self.job_model.save()
+
+    def tearDown(self):
+        super().tearDown()
+        get_task_backend.cache_clear()
+
+    def test_pass_job_runs_to_success(self):
+        from nautobot.extras.choices import JobResultStatusChoices
+        from nautobot.extras.models.jobs import JobResult
+
+        # Sanity: the active backend is Procrastinate.
+        self.assertIsInstance(get_task_backend(), ProcrastinateBackend)
+        self.assertEqual(get_task_backend().name, "procrastinate")
+
+        job_result = JobResult.enqueue_job(
+            job_model=self.job_model,
+            user=self.user,
+            synchronous=False,  # eager mode redirects this to enqueue_sync()
+        )
+        job_result.refresh_from_db()
+
+        self.assertEqual(
+            job_result.status,
+            JobResultStatusChoices.STATUS_SUCCESS,
+            f"Expected SUCCESS, got {job_result.status}. Traceback: {job_result.traceback}",
+        )
+        self.assertIsNotNone(job_result.date_started)
+        self.assertIsNotNone(job_result.date_done)
+        self.assertEqual(job_result.result, True)
+
+        # JobLogEntry capture: the lifecycle hooks in TestPassJob log
+        # info messages. Verify at least one made it through the handler.
+        log_messages = list(job_result.job_log_entries.values_list("message", flat=True))
+        self.assertTrue(
+            any("Success" in m or "called as expected" in m for m in log_messages),
+            f"Expected at least one lifecycle log entry, got: {log_messages}",
         )

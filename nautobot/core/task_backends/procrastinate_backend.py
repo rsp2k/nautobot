@@ -120,6 +120,20 @@ class ProcrastinateBackend(TaskBackend):
         kwargs: dict[str, Any],
         options: EnqueueOptions,
     ) -> DispatchResult:
+        # PROCRASTINATE_ALWAYS_EAGER short-circuits the deferral and runs the
+        # job inline. Mirrors Celery's CELERY_TASK_ALWAYS_EAGER. Used by
+        # Nautobot's test suite to run job-dispatching tests without a worker.
+        from django.conf import settings
+
+        if getattr(settings, "PROCRASTINATE_ALWAYS_EAGER", False):
+            return self.enqueue_sync(
+                job_result_id=job_result_id,
+                job_class_path=job_class_path,
+                args=args,
+                kwargs=kwargs,
+                options=options,
+            )
+
         task = self._get_task()
         task.defer(
             queue=options.queue or "default",
@@ -202,6 +216,7 @@ class ProcrastinateBackend(TaskBackend):
             ensure_job_log_handler_attached,
             make_job_request,
             open_branch_context,
+            task_id_log_context,
         )
         from nautobot.extras.choices import JobResultStatusChoices
         from nautobot.extras.jobs import get_job
@@ -218,7 +233,10 @@ class ProcrastinateBackend(TaskBackend):
         request = make_job_request(job_result_id, options)
         task_id = request.id  # canonical string form
 
-        with open_branch_context(options):
+        # task_id_log_context injects task_id onto log records so the
+        # NautobotDatabaseHandler can resolve them to JobResult (Celery's
+        # logger does this via context that doesn't exist here).
+        with task_id_log_context(task_id), open_branch_context(options):
             try:
                 job_class = get_job(job_class_path)
                 if job_class is None:
