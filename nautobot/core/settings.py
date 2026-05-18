@@ -643,6 +643,17 @@ INSTALLED_APPS = [
     "silk",
 ]
 
+# Procrastinate's Django app provides its own schema migrations and the
+# `nautobot-server procrastinate <subcommand>` management commands. We only
+# add it if the optional extra is installed. Sites that stay on Celery don't
+# need this; sites that set NAUTOBOT_TASK_BACKEND=procrastinate require it.
+try:
+    import procrastinate  # noqa: F401  # presence check only
+except ImportError:
+    pass
+else:
+    INSTALLED_APPS.append("procrastinate.contrib.django")
+
 # Middleware
 MIDDLEWARE = [
     "django_prometheus.middleware.PrometheusBeforeMiddleware",

@@ -64,6 +64,28 @@ services:
     env_file:
       - ./dev.env
     tty: true
+  procrastinate_worker:
+    # Opt-in service. Start with: docker compose --profile procrastinate up procrastinate_worker
+    # or: invoke start (with COMPOSE_PROFILES=procrastinate in the environment).
+    # This service is the Procrastinate equivalent of celery_worker. It is safe
+    # to leave celery_worker running alongside; tasks are routed to one backend
+    # only based on NAUTOBOT_TASK_BACKEND.
+    profiles:
+      - procrastinate
+    image: "local/nautobot-dev:local-${NAUTOBOT_VER}-py${PYTHON_VER}"
+    entrypoint: "watchmedo auto-restart --directory './' --pattern '*.py' --recursive -- nautobot-server procrastinate worker"
+    healthcheck:
+      disable: true  # procrastinate has no built-in ping; rely on logs for now
+    depends_on:
+      nautobot:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    environment:
+      NAUTOBOT_TASK_BACKEND: procrastinate
+    env_file:
+      - ./dev.env
+    tty: true
   redis:
     image: redis:6-alpine
     command:
