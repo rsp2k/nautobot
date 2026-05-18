@@ -105,34 +105,71 @@ class _TaskIdFilter(logging.Filter):
         return True
 
 
+class _FakeCeleryRequest:
+    """Minimal stand-in for celery.app.task.Context, exposing ``.id``."""
+
+    def __init__(self, task_id: str) -> None:
+        self.id = task_id
+
+
+class _FakeCeleryTask:
+    """Minimal stand-in for a celery Task instance.
+
+    Push one of these onto ``celery._state._task_stack`` so
+    ``celery.current_task`` resolves non-None during Procrastinate-driven
+    execution. The existing ``NautobotDatabaseHandler.emit()`` checks
+    ``current_task`` as a guard against running outside of a job context;
+    making it non-None lets the handler run under Procrastinate without any
+    changes to upstream code.
+    """
+
+    def __init__(self, task_id: str) -> None:
+        self.request = _FakeCeleryRequest(task_id)
+        self.name = "nautobot.run_job"
+
+
 @contextlib.contextmanager
 def task_id_log_context(task_id: str) -> "Iterator[None]":
-    """Temporarily attach a TaskIdFilter to the ``NautobotDatabaseHandler``
-    so log records emitted during a Procrastinate-driven job carry ``task_id``.
+    """Make NautobotDatabaseHandler treat the current thread as inside a job.
 
-    Python logging filters added to a *logger* only apply to records emitted
-    directly at that logger — not to records propagated from child loggers.
-    To affect every record reaching the database handler regardless of which
-    child logger emitted it, we attach the filter to the *handler* itself.
+    Two coordinated effects:
 
-    ``NautobotDatabaseHandler.emit`` reads ``record.task_id`` to look up the
-    JobResult. Without this filter, Procrastinate-driven jobs would log
-    successfully but no ``JobLogEntry`` rows would appear.
+      1. Pushes a minimal fake task onto celery's ``_task_stack`` so
+         ``celery.current_task`` resolves non-None. ``NautobotDatabaseHandler``
+         uses ``current_task`` as its "am I in a job?" gate; without this push
+         every log record from Procrastinate-driven jobs would be silently
+         dropped.
+
+      2. Attaches a logging filter to the ``NautobotDatabaseHandler`` that
+         injects ``task_id`` onto records that don't already carry it. Under
+         Celery, ``celery.utils.log.TaskFormatter`` attaches this attribute
+         automatically; under Procrastinate it has to come from somewhere.
+         Filters on the handler (not the logger) apply to all records reaching
+         the handler regardless of which child logger emitted them.
+
+    Exits cleanly even on exception so we don't pollute celery's state across
+    job boundaries.
     """
+    from celery._state import _task_stack
     from celery.utils.log import get_logger
 
     from nautobot.core.celery.log import NautobotDatabaseHandler
+
+    fake_task = _FakeCeleryTask(task_id)
+    _task_stack.push(fake_task)
 
     task_logger = get_logger("celery.task")
     db_handlers = [h for h in task_logger.handlers if isinstance(h, NautobotDatabaseHandler)]
     flt = _TaskIdFilter(task_id)
     for h in db_handlers:
         h.addFilter(flt)
+
     try:
         yield
     finally:
         for h in db_handlers:
             h.removeFilter(flt)
+        _task_stack.pop()
 
 
 def ensure_job_log_handler_attached() -> None:

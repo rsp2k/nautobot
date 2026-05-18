@@ -174,6 +174,14 @@ class ProcrastinateBackend(TaskBackend):
         # "unknown" to the StatusView.
         return -1
 
+    def get_periodic_runner(self):
+        # Procrastinate has no built-in DB-row-driven scheduler; we ship our
+        # own. CeleryBackend returns None because celery beat is a separate
+        # OS process.
+        from .procrastinate_periodic import NautobotProcrastinatePeriodicRunner
+
+        return NautobotProcrastinatePeriodicRunner()
+
     # --- in-worker execution ---
 
     @staticmethod

@@ -31,6 +31,9 @@ from nautobot.core.task_backends.procrastinate_backend import (
     _options_from_jsonable_dict,
     _options_to_jsonable_dict,
 )
+from nautobot.core.task_backends.procrastinate_periodic import (
+    NautobotProcrastinatePeriodicRunner,
+)
 
 
 class DispatchResultTests(SimpleTestCase):
@@ -579,4 +582,57 @@ class ProcrastinateBackendEndToEndTests(TransactionTestCase):
         self.assertTrue(
             any("Success" in m or "called as expected" in m for m in log_messages),
             f"Expected at least one lifecycle log entry, got: {log_messages}",
+        )
+
+
+class ProcrastinatePeriodicRunnerTests(SimpleTestCase):
+    """Unit-level checks on the periodic runner's tick logic without touching
+    the ScheduledJob model (those tests live in the integration test class).
+    """
+
+    def test_runner_returned_by_backend(self):
+        """ProcrastinateBackend.get_periodic_runner() returns an instance."""
+        backend = ProcrastinateBackend()
+        runner = backend.get_periodic_runner()
+        self.assertIsInstance(runner, NautobotProcrastinatePeriodicRunner)
+
+    def test_celery_backend_has_no_runner(self):
+        """CeleryBackend uses celery beat as a separate process."""
+        backend = CeleryBackend()
+        self.assertIsNone(backend.get_periodic_runner())
+
+    def test_should_fire_respects_start_time_window(self):
+        """A schedule with a future start_time is not yet due."""
+        import datetime
+
+        # Sentinel schedule object — only the attributes accessed by
+        # _should_fire need to exist.
+        now = datetime.datetime(2026, 5, 17, 22, 0, tzinfo=datetime.timezone.utc)
+
+        class _Sched:
+            start_time = datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc)
+            stop_time = None
+            last_run_at = None
+            schedule = None  # not reached due to start_time guard
+            pk = 1
+
+        self.assertFalse(
+            NautobotProcrastinatePeriodicRunner._should_fire(_Sched(), now)
+        )
+
+    def test_should_fire_respects_stop_time_window(self):
+        """A schedule past its stop_time does not fire."""
+        import datetime
+
+        now = datetime.datetime(2026, 5, 17, 22, 0, tzinfo=datetime.timezone.utc)
+
+        class _Sched:
+            start_time = None
+            stop_time = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+            last_run_at = None
+            schedule = None
+            pk = 2
+
+        self.assertFalse(
+            NautobotProcrastinatePeriodicRunner._should_fire(_Sched(), now)
         )

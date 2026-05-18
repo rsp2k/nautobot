@@ -20,6 +20,10 @@ services:
     volumes:
       - ./nautobot_config.py:/opt/nautobot/nautobot_config.py
       - ../:/source
+  procrastinate_scheduler:
+    volumes:
+      - ./nautobot_config.py:/opt/nautobot/nautobot_config.py
+      - ../:/source
   mkdocs:
     volumes:
       - ../:/source

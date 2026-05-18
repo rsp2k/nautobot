@@ -64,6 +64,26 @@ services:
     env_file:
       - ./dev.env
     tty: true
+  procrastinate_scheduler:
+    # Opt-in service. Start with: docker compose --profile procrastinate up procrastinate_scheduler
+    # Equivalent to celery_beat for the Procrastinate path. Reads ScheduledJob
+    # rows and enqueues due jobs via the active TaskBackend.
+    profiles:
+      - procrastinate
+    image: "local/nautobot-dev:local-${NAUTOBOT_VER}-py${PYTHON_VER}"
+    entrypoint: "watchmedo auto-restart --directory './' --pattern '*.py' --recursive -- nautobot-server nautobot_scheduler"
+    healthcheck:
+      disable: true
+    depends_on:
+      nautobot:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    environment:
+      NAUTOBOT_TASK_BACKEND: procrastinate
+    env_file:
+      - ./dev.env
+    tty: true
   procrastinate_worker:
     # Opt-in service. Start with: docker compose --profile procrastinate up procrastinate_worker
     # or: invoke start (with COMPOSE_PROFILES=procrastinate in the environment).
