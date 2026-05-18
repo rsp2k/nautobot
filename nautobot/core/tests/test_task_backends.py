@@ -358,3 +358,104 @@ class GetTaskBackendProcrastinateTests(SimpleTestCase):
         backend = get_task_backend()
         self.assertIsInstance(backend, ProcrastinateBackend)
         self.assertEqual(backend.name, "procrastinate")
+
+
+class JobRequestTests(SimpleTestCase):
+    """JobRequest is the duck-typed request object set on Job.request when
+    running under non-Celery backends. Existing user code reads .id and
+    .properties — both must work the same as under Celery.
+    """
+
+    def test_default_properties_is_empty_dict(self):
+        from nautobot.core.task_backends.runner import JobRequest
+
+        req = JobRequest(id="abc")
+        self.assertEqual(req.id, "abc")
+        self.assertEqual(req.properties, {})
+
+    def test_properties_isolation_between_instances(self):
+        # Mutable-default footgun guard.
+        from nautobot.core.task_backends.runner import JobRequest
+
+        a = JobRequest(id="a")
+        b = JobRequest(id="b")
+        a.properties["k"] = 1
+        self.assertNotIn("k", b.properties)
+
+
+class BuildCeleryShapedPropertiesTests(SimpleTestCase):
+    """The ``nautobot_job_*`` keys NautobotTask reads from request.properties
+    must be present even under Procrastinate, so any user middleware that
+    introspects them continues to work.
+    """
+
+    def test_all_fields_translated(self):
+        from nautobot.core.task_backends.runner import build_celery_shaped_properties
+
+        user_id = uuid4()
+        job_model_id = uuid4()
+        schedule_id = uuid4()
+        opts = EnqueueOptions(
+            user_id=user_id,
+            job_model_id=job_model_id,
+            schedule_id=schedule_id,
+            branch_name="b1",
+            ignore_singleton_lock=True,
+            console_log=True,
+            profile=True,
+        )
+        props = build_celery_shaped_properties(opts)
+        self.assertEqual(props["nautobot_job_user_id"], str(user_id))
+        self.assertEqual(props["nautobot_job_job_model_id"], str(job_model_id))
+        self.assertEqual(props["nautobot_job_schedule_id"], str(schedule_id))
+        self.assertEqual(props["nautobot_job_branch_name"], "b1")
+        self.assertTrue(props["nautobot_job_ignore_singleton_lock"])
+        self.assertTrue(props["nautobot_job_console_log"])
+        self.assertTrue(props["nautobot_job_profile"])
+
+    def test_none_uuids_serialize_to_none(self):
+        from nautobot.core.task_backends.runner import build_celery_shaped_properties
+
+        opts = EnqueueOptions()
+        props = build_celery_shaped_properties(opts)
+        self.assertIsNone(props["nautobot_job_user_id"])
+        self.assertIsNone(props["nautobot_job_job_model_id"])
+        self.assertIsNone(props["nautobot_job_schedule_id"])
+
+
+class MakeJobRequestTests(SimpleTestCase):
+    def test_constructs_with_string_id_and_translated_properties(self):
+        from nautobot.core.task_backends.runner import make_job_request
+
+        task_id = uuid4()
+        opts = EnqueueOptions(user_id=uuid4(), branch_name="dev")
+        req = make_job_request(task_id, opts)
+        self.assertEqual(req.id, str(task_id))
+        self.assertIsInstance(req.id, str)
+        self.assertEqual(req.properties["nautobot_job_branch_name"], "dev")
+
+
+class EnsureJobLogHandlerAttachedTests(SimpleTestCase):
+    """The handler attachment must be idempotent so repeated calls (e.g. one
+    per Procrastinate job) don't pile up duplicates on the same logger.
+    """
+
+    def test_idempotent_attach(self):
+        from celery.utils.log import get_logger
+
+        from nautobot.core.celery.log import NautobotDatabaseHandler
+        from nautobot.core.task_backends.runner import ensure_job_log_handler_attached
+
+        ensure_job_log_handler_attached()
+        ensure_job_log_handler_attached()
+        ensure_job_log_handler_attached()
+
+        task_logger = get_logger("celery.task")
+        nautobot_handlers = [
+            h for h in task_logger.handlers if isinstance(h, NautobotDatabaseHandler)
+        ]
+        self.assertEqual(
+            len(nautobot_handlers),
+            1,
+            f"Expected exactly 1 NautobotDatabaseHandler after 3 calls; got {len(nautobot_handlers)}",
+        )

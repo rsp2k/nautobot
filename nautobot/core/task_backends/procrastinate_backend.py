@@ -174,65 +174,98 @@ class ProcrastinateBackend(TaskBackend):
     ) -> Any:
         """Run a job under Procrastinate.
 
-        v1 skeleton: marks JobResult as STARTED, attempts to run the job,
-        marks SUCCESS or FAILURE. Does not yet:
-          - install NautobotDatabaseHandler for log capture (Task #6)
-          - propagate branch context (Task #6)
-          - honor soft_time_limit / time_limit (Task #6)
+        Bridges Procrastinate's worker context to the Nautobot Job lifecycle:
 
-        Implementations of those concerns live in CeleryBackend today; the
-        bridging work in Task #6 extracts the shared parts into a helper that
-        both backends call.
+        - Attaches ``NautobotDatabaseHandler`` so log records become
+          ``JobLogEntry`` rows (Celery does this via signal at worker start;
+          we have no equivalent signal here).
+        - Enters a ``BranchContext`` for the duration of the job, mirroring
+          what ``NautobotTask.before_start`` does under Celery.
+        - Synthesizes a Celery-shaped ``JobRequest`` on the job instance so
+          user code that reads ``self.request.id`` / ``self.request.properties``
+          works transparently.
+        - Calls the BaseJob lifecycle hooks in the same order as
+          ``nautobot.extras.jobs.run_job``: before_start -> __call__ ->
+          on_success / on_failure -> after_return.
+        - Updates ``JobResult.status`` / ``date_started`` / ``date_done`` /
+          ``result`` directly (Procrastinate has no result-backend pipeline).
+
+        Not yet implemented (tracked as follow-ups):
+          - ``soft_time_limit`` / ``time_limit`` enforcement (SIGALRM trick)
+          - Singleton lock pre-flight check (Celery does this in _prepare_job)
+          - Prometheus counters (started_jobs_counter / finished_jobs_counter)
+          - "Job started/completed" event publication via publish_event
         """
         # Lazy imports to keep module import cheap and avoid Django setup
         # ordering issues with model imports.
+        from nautobot.core.task_backends.runner import (
+            ensure_job_log_handler_attached,
+            make_job_request,
+            open_branch_context,
+        )
         from nautobot.extras.choices import JobResultStatusChoices
         from nautobot.extras.jobs import get_job
         from nautobot.extras.models.jobs import JobResult
+
+        # Ensure JobLogEntry capture works under Procrastinate workers.
+        ensure_job_log_handler_attached()
 
         job_result = JobResult.objects.get(id=job_result_id)
         job_result.date_started = timezone.now()
         job_result.status = JobResultStatusChoices.STATUS_STARTED
         job_result.save()
 
-        try:
-            job_class = get_job(job_class_path)
-            if job_class is None:
-                raise LookupError(f"Job class not found: {job_class_path}")
-            job_instance = job_class()
-            job_instance.job_result = job_result
-            # Mirror Celery's lifecycle order. Lacking a bound-task self,
-            # before_start / after_return get None placeholders for now.
-            job_instance.before_start(task_id=str(job_result_id), args=args, kwargs=kwargs)
+        request = make_job_request(job_result_id, options)
+        task_id = request.id  # canonical string form
+
+        with open_branch_context(options):
             try:
-                result = job_instance(*args, **kwargs)
-                job_instance.on_success(retval=result, task_id=str(job_result_id), args=args, kwargs=kwargs)
-                job_result.status = JobResultStatusChoices.STATUS_SUCCESS
-                job_result.result = result
-                return result
-            except Exception as exc:
-                job_instance.on_failure(
-                    exc=exc,
-                    task_id=str(job_result_id),
-                    args=args,
-                    kwargs=kwargs,
-                    einfo=None,
-                )
-                job_result.status = JobResultStatusChoices.STATUS_FAILURE
-                job_result.result = {"exc_type": type(exc).__name__, "exc_message": str(exc)}
-                raise
+                job_class = get_job(job_class_path)
+                if job_class is None:
+                    raise LookupError(f"Job class not found: {job_class_path}")
+                job_instance = job_class()
+                job_instance.request = request
+
+                job_instance.before_start(task_id=task_id, args=args, kwargs=kwargs)
+                try:
+                    result = job_instance(*args, **kwargs)
+                    if not getattr(job_instance, "_failed", False):
+                        job_instance.on_success(
+                            retval=result, task_id=task_id, args=args, kwargs=kwargs
+                        )
+                        job_result.status = JobResultStatusChoices.STATUS_SUCCESS
+                    else:
+                        # The Job marked itself as failed via Job.fail() without raising;
+                        # CeleryBackend handles this via update_state + Ignore. Here we
+                        # set the status directly.
+                        job_instance.on_failure(
+                            exc=result, task_id=task_id, args=args, kwargs=kwargs, einfo=None
+                        )
+                        job_result.status = JobResultStatusChoices.STATUS_FAILURE
+                    job_result.result = result
+                    return result
+                except Exception as exc:
+                    job_instance.on_failure(
+                        exc=exc, task_id=task_id, args=args, kwargs=kwargs, einfo=None
+                    )
+                    job_result.status = JobResultStatusChoices.STATUS_FAILURE
+                    job_result.result = {
+                        "exc_type": type(exc).__name__,
+                        "exc_message": str(exc),
+                    }
+                    raise
+                finally:
+                    job_instance.after_return(
+                        status=job_result.status,
+                        retval=job_result.result,
+                        task_id=task_id,
+                        args=args,
+                        kwargs=kwargs,
+                        einfo=None,
+                    )
             finally:
-                job_instance.after_return(
-                    status=job_result.status,
-                    retval=job_result.result,
-                    task_id=str(job_result_id),
-                    args=args,
-                    kwargs=kwargs,
-                    einfo=None,
-                )
-        finally:
-            job_result.date_done = timezone.now()
-            job_result.save()
+                job_result.date_done = timezone.now()
+                job_result.save()
 
 
 # --- helpers ---
