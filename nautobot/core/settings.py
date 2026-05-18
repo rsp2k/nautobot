@@ -651,7 +651,14 @@ INSTALLED_APPS = [
 # module into the settings namespace (some introspection-based tests walk it).
 import importlib.util as _importlib_util
 
-if _importlib_util.find_spec("procrastinate") is not None:
+# Only include if the operator actually selected procrastinate. The conditional
+# is on the env var because the TASK_BACKEND setting is declared later in this
+# file. Sites that stay on Celery skip the extra migrations & app registration
+# even if procrastinate happens to be installed.
+if (
+    _importlib_util.find_spec("procrastinate") is not None
+    and os.getenv("NAUTOBOT_TASK_BACKEND", "celery") == "procrastinate"
+):
     INSTALLED_APPS.append("procrastinate.contrib.django")
 del _importlib_util
 

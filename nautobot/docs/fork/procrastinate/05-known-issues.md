@@ -24,27 +24,67 @@ transaction` state holding a closed cursor for the duration of the hang.
   `nautobot-server test` invocation hangs in fixture loading, both with and
   without `--parallel`, and with both fresh and reused test databases.
 
-**Reproduces only when:** `procrastinate.contrib.django` is in
-`INSTALLED_APPS`. Before that addition (Task #4 era), the same 30 tests
-passed in ~107 seconds.
+**What we initially suspected and then ruled out:** Initial suspicion was
+that `procrastinate.contrib.django` being in `INSTALLED_APPS` was causing
+DB-connection interference. **Investigation disproved this.** The conditional
+add (now in `settings.py`) keeps procrastinate out of `INSTALLED_APPS` under
+`TASK_BACKEND=celery`, and the hang still reproduces. So the cause is
+elsewhere.
 
-**Hypotheses (none yet verified):**
+**What the PostgreSQL view actually shows:**
 
-1. `procrastinate.contrib.django` uses async DB connections that interact
-   poorly with Django's parallel test framework's transaction wrapping.
-2. Procrastinate's migrations are creating tables whose constraints or
-   triggers conflict with Nautobot's test fixture loading order.
-3. A signal handler registered by procrastinate.contrib.django runs during
-   each test setUp and blocks on a DB connection.
+```sql
+-- During the hang:
+ pid   | state               | wait_event | query
+ 51182 | idle in transaction | ClientRead | INSERT INTO extras_joblogentry ...
+                                            ('Deleting 3 jobs...')
+ 51178 | idle in transaction | ClientRead | CLOSE _django_curs_..._sync_271
+```
+
+Both connections are waiting on `Client/ClientRead` — Postgres is waiting
+for the Python client to send the next query (or commit/rollback). The
+client side has stopped responding. The "Deleting 3 jobs..." log message
+is emitted by `nautobot.core.jobs.bulk_actions.BulkDeleteObjects.run()`
+(`nautobot/core/jobs/bulk_actions.py:246`), so some test is exercising
+that job and getting stuck after the log entry is buffered for insert.
+
+**Updated hypotheses:**
+
+1. **Test DB state corruption from previously killed runs.** Earlier in
+   the same session, several `nautobot-server test` invocations were
+   SIGKILLed mid-test. The `--keepdb` flag preserves the test DB across
+   runs. If a killed run left uncommitted state (e.g., procrastinate
+   tables in a transient migration state), every subsequent `--keepdb`
+   run inherits it. **A clean `--no-keepdb --no-cache-test-fixtures`
+   run still hangs, so this isn't the only cause, but is probably a
+   contributing factor.**
+
+2. **Interaction between `--parallel` and the cross-DB JobLogEntry
+   handler.** Nautobot writes log entries to a separate `job_logs` DB
+   alias. Under `--parallel`, fork workers each get their own connection
+   to both DBs. If one worker holds a transaction on the default DB and
+   another worker tries to read from `job_logs`, Django's
+   `DATABASE_ROUTERS` config may serialize the access in an unexpected
+   way. Worth testing with `--no-parallel`.
+
+3. **Cross-fork pickle/import of `_FakeCeleryTask` or `task_id_log_context`
+   state.** Even though these are never invoked under Celery, they're
+   imported when `nautobot.core.task_backends.runner` is imported. If
+   the module-level imports do anything stateful, fork workers might
+   inherit a partial state.
 
 **Investigation starting points:**
 
-- Strace the stuck fork worker to see what syscall it's blocked on.
-- Compare `psql -c "\dt+ procrastinate_*"` before vs. during the hang.
-- Try removing `procrastinate.contrib.django` from INSTALLED_APPS
-  temporarily and confirming the hang goes away.
-- Check whether the same hang happens with newer/older procrastinate
-  versions (we're on 3.8.1).
+- Strace the stuck fork worker (PID from `pg_stat_activity` → host PID
+  via `nsenter`) to confirm the Python process is blocked on a system
+  call (likely a futex or read) vs. spinning in user code.
+- Run with `--no-parallel` and a freshly-dropped test DB to isolate (1) vs.
+  (2). The session ran `--no-parallel` once and it also hung, but the
+  test DB had leftover state from earlier; need to retry with
+  `--no-parallel --no-keepdb`.
+- Bisect the recent commits. Git checkout the last commit before
+  `2725b1e28 Add ProcrastinateBackend skeleton` and confirm the hang
+  doesn't reproduce there. Then re-apply commits one at a time.
 
 **Impact:** Low for production deployments — the backend itself works
 end-to-end (verified by `ProcrastinateBackendEndToEndTests`). Medium for
