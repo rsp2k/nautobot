@@ -3,7 +3,58 @@
 This page tracks open items in the Procrastinate fork. Each entry has enough
 context to pick up and investigate without re-tracing how we got here.
 
-## Test interaction: full `JobTransactionTest` suite hangs when procrastinate is installed
+## `test_bulk_delete_system_jobs_fail` hangs in isolation (NOT a fork-introduced bug)
+
+**Reproduced on upstream `develop` (`a726cdbff`, before any of this fork's
+commits):**
+
+```bash
+git checkout a726cdbff
+invoke tests \
+    --label nautobot.extras.tests.test_jobs.JobTransactionTest.test_bulk_delete_system_jobs_fail \
+    --no-parallel --no-keepdb --no-cache-test-fixtures --no-input \
+    --skip-docs-build --failfast
+```
+
+This hangs indefinitely after "System check identified no issues". A
+PostgreSQL `\dx` shows:
+
+```
+ pid  | state               | wait_event | query
+ 3148 | idle in transaction | ClientRead | CLOSE "_django_curs_..._sync_255"
+ 3341 | idle                | ClientRead | INSERT INTO "extras_joblogentry" ... ('Deleting 3 jobs...')
+```
+
+Both connections waiting on `Client/ClientRead` — Postgres is waiting for
+the Python client to send the next query. The Python client has stopped
+responding.
+
+**This is a pre-existing upstream Nautobot bug or test-runner
+configuration interaction, NOT introduced by this fork.** The original
+investigation suspected `procrastinate.contrib.django` or my CeleryBackend
+refactor; both were ruled out by reproducing the hang on unmodified
+upstream code.
+
+**Suspected cause:** `nautobot.extras.utils.bulk_delete_with_bulk_change_logging`
+opens a server-side cursor via `qs.iterator(chunk_size=1000)` inside a
+`transaction.atomic()`. When the test invokes `BulkDeleteObjects` on
+system jobs (which `Job.delete()` rejects via `ProtectedError`), the
+iterator might be partially consumed leaving the cursor open. Combined
+with the cross-DB `JobLogEntry` insert on the `job_logs` alias, something
+in the connection-management dance stops responding.
+
+**File:** `nautobot/extras/utils.py:934` — `bulk_delete_with_bulk_change_logging`.
+
+**Workaround:** Run targeted test labels rather than the full
+JobTransactionTest sweep. Or run with `--keepdb --cache-test-fixtures`
+(invoke defaults) — those flag combinations were the ones that succeeded
+in this session's earlier (Task #4 / Task #6) test runs.
+
+**Open for upstream maintainers, not for this fork.**
+
+---
+
+## Original investigation: full `JobTransactionTest` suite hangs when procrastinate is installed
 
 **Symptom:** Running `invoke tests --label
 nautobot.extras.tests.test_jobs.JobTransactionTest` hangs indefinitely
