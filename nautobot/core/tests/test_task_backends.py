@@ -25,6 +25,12 @@ from nautobot.core.task_backends.celery_backend import (
     CeleryBackend,
     _build_celery_kwargs_dict,
 )
+from nautobot.core.task_backends.procrastinate_backend import (
+    PROCRASTINATE_JOB_TASK_NAME,
+    ProcrastinateBackend,
+    _options_from_jsonable_dict,
+    _options_to_jsonable_dict,
+)
 
 
 class DispatchResultTests(SimpleTestCase):
@@ -240,3 +246,115 @@ class CeleryBackendDispatchTests(SimpleTestCase):
 
         mock_console_task.apply_async.assert_called_once()
         mock_run_job.apply_async.assert_not_called()
+
+
+class ProcrastinateBackendImportSafetyTests(SimpleTestCase):
+    """ProcrastinateBackend must be import-safe even when procrastinate
+    isn't installed, so sites that stick with Celery don't carry the dep.
+    """
+
+    def test_module_imports_without_procrastinate(self):
+        # If this test module loaded, the procrastinate_backend module
+        # also loaded successfully — and procrastinate may or may not be
+        # installed. Either way, the import succeeded.
+        self.assertIsNotNone(ProcrastinateBackend)
+        self.assertEqual(PROCRASTINATE_JOB_TASK_NAME, "nautobot.run_job")
+
+    def test_can_instantiate_without_procrastinate(self):
+        # Instantiation must not import procrastinate. The lazy load happens
+        # on first call to a method that actually needs it.
+        backend = ProcrastinateBackend()
+        self.assertEqual(backend.name, "procrastinate")
+        self.assertIsNone(backend._app)
+        self.assertIsNone(backend._task)
+
+    def test_get_active_workers_returns_unknown(self):
+        # Even without procrastinate installed, this must not raise.
+        backend = ProcrastinateBackend()
+        self.assertEqual(backend.get_active_workers(), -1)
+
+    def test_missing_procrastinate_gives_clear_error(self):
+        backend = ProcrastinateBackend()
+        # Simulate procrastinate not being installed.
+        with mock.patch.dict(
+            "sys.modules", {"procrastinate.contrib.django": None}
+        ):
+            with self.assertRaises(ImportError) as cm:
+                backend._get_app()
+        self.assertIn("procrastinate", str(cm.exception).lower())
+        self.assertIn("nautobot[procrastinate]", str(cm.exception))
+
+
+class ProcrastinateOptionsSerializationTests(SimpleTestCase):
+    """The options payload travels through Procrastinate's JSON storage in
+    PostgreSQL. UUIDs must survive a round-trip through ``dict[str, Any]``
+    without losing their type.
+    """
+
+    def test_round_trip_with_all_fields(self):
+        user_id = uuid4()
+        job_model_id = uuid4()
+        schedule_id = uuid4()
+        original = EnqueueOptions(
+            queue="cleanup",
+            soft_time_limit=30.0,
+            time_limit=60.0,
+            profile=True,
+            console_log=True,
+            ignore_singleton_lock=True,
+            user_id=user_id,
+            job_model_id=job_model_id,
+            schedule_id=schedule_id,
+            branch_name="feature-x",
+            extra={"custom": "value"},
+        )
+        as_dict = _options_to_jsonable_dict(original)
+        restored = _options_from_jsonable_dict(as_dict)
+        self.assertEqual(restored, original)
+        # And specifically: types are preserved, not stringified UUIDs.
+        self.assertIsInstance(restored.user_id, UUID)
+        self.assertIsInstance(restored.job_model_id, UUID)
+        self.assertIsInstance(restored.schedule_id, UUID)
+
+    def test_jsonable_dict_is_actually_json_serializable(self):
+        # Procrastinate stores the payload as JSON; if any field can't be
+        # serialized this test catches it before runtime.
+        import json
+
+        options = EnqueueOptions(
+            queue="q",
+            user_id=uuid4(),
+            job_model_id=uuid4(),
+            schedule_id=uuid4(),
+            branch_name="b",
+            extra={"k": "v"},
+        )
+        payload = _options_to_jsonable_dict(options)
+        # Must not raise.
+        encoded = json.dumps(payload)
+        decoded = json.loads(encoded)
+        self.assertEqual(decoded["queue"], "q")
+        self.assertIsInstance(decoded["user_id"], str)
+
+    def test_round_trip_with_minimal_fields(self):
+        original = EnqueueOptions()
+        restored = _options_from_jsonable_dict(_options_to_jsonable_dict(original))
+        self.assertEqual(restored, original)
+
+
+class GetTaskBackendProcrastinateTests(SimpleTestCase):
+    """The factory recognizes 'procrastinate' as a built-in name and resolves
+    to ProcrastinateBackend.
+    """
+
+    def setUp(self):
+        get_task_backend.cache_clear()
+
+    def tearDown(self):
+        get_task_backend.cache_clear()
+
+    @override_settings(TASK_BACKEND="procrastinate")
+    def test_procrastinate_string_resolves_to_backend(self):
+        backend = get_task_backend()
+        self.assertIsInstance(backend, ProcrastinateBackend)
+        self.assertEqual(backend.name, "procrastinate")

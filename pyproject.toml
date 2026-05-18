@@ -139,6 +139,9 @@ mysql = [ "mysqlclient (>=2.2.8,<2.3)" ]
 napalm = [ "napalm (>=4.1.0,<6.0.0)" ]
 # External Storage support (i.e. S3)
 remote_storage = [ "django-storages (>=1.14.6,<1.15)" ]
+# Procrastinate task backend (alternative to Celery, uses PostgreSQL LISTEN/NOTIFY)
+# Enable with NAUTOBOT_TASK_BACKEND=procrastinate
+procrastinate = [ "procrastinate (>=3.8.1,<3.9)" ]
 # Social authentication core
 # Note that social-auth-app-django (below) is *not* an optional dependency, and it requires social-auth-core in turn.
 # The only part of this dependency that is actually optional is in fact social-auth-core's "saml" extra.
