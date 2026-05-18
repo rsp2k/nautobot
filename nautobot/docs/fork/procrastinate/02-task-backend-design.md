@@ -2,7 +2,7 @@
 
 > **Status:** Draft for review.
 > **Predecessor:** [01-celery-surface-inventory.md](./01-celery-surface-inventory.md)
-> **Next:** Implementation in `nautobot.core.tasks` (new package)
+> **Next:** Implementation in `nautobot.core.task_backends` (new package)
 
 ## Goals
 
@@ -20,7 +20,7 @@
 
 ## Design summary
 
-Introduce a small `TaskBackend` interface in `nautobot.core.tasks`. Existing Celery wiring stays in `nautobot.core.celery` but is wrapped as `CeleryBackend`. A second module `nautobot.core.tasks.procrastinate` adds `ProcrastinateBackend`. A single setting (`NAUTOBOT_TASK_BACKEND`) selects which backend the runtime uses.
+Introduce a small `TaskBackend` interface in `nautobot.core.task_backends`. Existing Celery wiring stays in `nautobot.core.celery` but is wrapped as `CeleryBackend`. A second module `nautobot.core.task_backends.procrastinate` adds `ProcrastinateBackend`. A single setting (`NAUTOBOT_TASK_BACKEND`) selects which backend the runtime uses.
 
 `JobResult.enqueue_job()` — the single chokepoint identified in the audit — is the only place in `nautobot/extras/` that calls into the backend. Everything else (logging handlers, scheduler, prometheus, control commands) stays in each backend's own module. This is the **minimal interface** option chosen during design review: backend-specific concerns aren't forced into a shared shape they don't fit.
 
@@ -42,7 +42,7 @@ Introduce a small `TaskBackend` interface in `nautobot.core.tasks`. Existing Cel
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│              nautobot.core.tasks.TaskBackend (ABC)              │
+│              nautobot.core.task_backends.TaskBackend (ABC)              │
 │                                                                 │
 │   enqueue(job_result_id, job_class_path, args, kwargs, **opts)  │
 │   enqueue_sync(...)            # for CELERY_TASK_ALWAYS_EAGER   │
@@ -75,7 +75,8 @@ Old settings remain. `CELERY_*` settings only matter when `TASK_BACKEND == "cele
 ```
 nautobot/
   core/
-    tasks/
+    task_backends/             # NOTE: not `tasks/` because nautobot.core.tasks
+                               # already exists (release-fetching module)
       __init__.py              # get_task_backend() factory + caching
       base.py                  # TaskBackend ABC + PeriodicRunner ABC
       celery_backend.py        # CeleryBackend (thin wrapper)
@@ -89,12 +90,12 @@ nautobot/
       ...
 ```
 
-Why a separate `nautobot.core.tasks` package instead of putting `TaskBackend` inside `nautobot.core.celery`? Naming. Calling the abstract layer "celery.TaskBackend" is misleading once Procrastinate is real. Future maintainers should be able to find the abstraction by name.
+Why a separate `nautobot.core.task_backends` package instead of putting `TaskBackend` inside `nautobot.core.celery`? Naming. Calling the abstract layer "celery.TaskBackend" is misleading once Procrastinate is real. Future maintainers should be able to find the abstraction by name.
 
 ## The interface
 
 ```python
-# nautobot/core/tasks/base.py
+# nautobot/core/task_backends/base.py
 from __future__ import annotations
 import abc
 from dataclasses import dataclass
@@ -127,8 +128,8 @@ class EnqueueOptions:
 class TaskBackend(abc.ABC):
     """Backend-agnostic interface for enqueueing and inspecting Nautobot Jobs.
 
-    Implementations live in nautobot.core.tasks.celery_backend and
-    nautobot.core.tasks.procrastinate_backend.
+    Implementations live in nautobot.core.task_backends.celery_backend and
+    nautobot.core.task_backends.procrastinate_backend.
     """
 
     name: str  # "celery" | "procrastinate"
@@ -186,7 +187,7 @@ class TaskBackend(abc.ABC):
 ```
 
 ```python
-# nautobot/core/tasks/base.py (continued)
+# nautobot/core/task_backends/base.py (continued)
 class PeriodicRunner(abc.ABC):
     """Runs ScheduledJob rows on schedule. Distinct from TaskBackend because:
        - Celery beat runs as a separate OS process (delegated to it entirely)
@@ -202,7 +203,7 @@ class PeriodicRunner(abc.ABC):
 ## Backend selection
 
 ```python
-# nautobot/core/tasks/__init__.py
+# nautobot/core/task_backends/__init__.py
 from functools import lru_cache
 from django.conf import settings
 from django.utils.module_loading import import_string
@@ -210,8 +211,8 @@ from django.utils.module_loading import import_string
 from .base import TaskBackend, EnqueueOptions, DispatchResult, PeriodicRunner
 
 _BUILTIN_BACKENDS = {
-    "celery":       "nautobot.core.tasks.celery_backend.CeleryBackend",
-    "procrastinate":"nautobot.core.tasks.procrastinate_backend.ProcrastinateBackend",
+    "celery":       "nautobot.core.task_backends.celery_backend.CeleryBackend",
+    "procrastinate":"nautobot.core.task_backends.procrastinate_backend.ProcrastinateBackend",
 }
 
 
@@ -253,7 +254,7 @@ After:
 
 ```python
 # nautobot/extras/models/jobs.py (after)
-from nautobot.core.tasks import get_task_backend, EnqueueOptions
+from nautobot.core.task_backends import get_task_backend, EnqueueOptions
 
 @classmethod
 def enqueue_job(cls, job_model, user, ...):
@@ -293,7 +294,7 @@ Diff is small. The Celery-specific `celery_kwargs` keys (`nautobot_job_user_id`,
 A thin wrapper. The body of `CeleryBackend.enqueue()` is essentially what `enqueue_job()` does today, lifted out of `JobResult` and into the backend module.
 
 ```python
-# nautobot/core/tasks/celery_backend.py
+# nautobot/core/task_backends/celery_backend.py
 class CeleryBackend(TaskBackend):
     name = "celery"
 
@@ -333,7 +334,7 @@ This makes Task #4 a refactor in the strict sense: no behavior change. Existing 
 The new code. Sketch:
 
 ```python
-# nautobot/core/tasks/procrastinate_backend.py
+# nautobot/core/task_backends/procrastinate_backend.py
 class ProcrastinateBackend(TaskBackend):
     name = "procrastinate"
 
@@ -371,14 +372,14 @@ class ProcrastinateBackend(TaskBackend):
         return DispatchResult(task_id=job_result_id, backend=self.name)
 ```
 
-The shared lifecycle helper `_execute_job_lifecycle()` lives in `nautobot.core.tasks.runner` and is called by both `run_job` (Celery wrapper) and `_run_job` (Procrastinate wrapper). That's where we *deduplicate* the job execution body so both backends behave identically.
+The shared lifecycle helper `_execute_job_lifecycle()` lives in `nautobot.core.task_backends.runner` and is called by both `run_job` (Celery wrapper) and `_run_job` (Procrastinate wrapper). That's where we *deduplicate* the job execution body so both backends behave identically.
 
 ### Serializer shim
 
-Extracted from `nautobot.core.celery.encoders` into `nautobot.core.tasks.serializers`:
+Extracted from `nautobot.core.celery.encoders` into `nautobot.core.task_backends.serializers`:
 
 ```python
-# nautobot/core/tasks/serializers.py
+# nautobot/core/task_backends/serializers.py
 from nautobot.core.celery.encoders import NautobotKombuJSONEncoder, nautobot_kombu_json_loads_hook
 import json
 
@@ -391,7 +392,7 @@ def loads(s: str):
 
 Procrastinate's `defer()` accepts any JSON-serializable payload. We pre-serialize Django model arguments through `dumps()` at the call site and reverse with `loads()` inside the worker. CeleryBackend keeps Kombu registration as-is.
 
-(Future: PR upstream to move `NautobotKombuJSONEncoder` from `nautobot.core.celery.encoders` into `nautobot.core.tasks.serializers` and re-export from old path. Upstream-friendly.)
+(Future: PR upstream to move `NautobotKombuJSONEncoder` from `nautobot.core.celery.encoders` into `nautobot.core.task_backends.serializers` and re-export from old path. Upstream-friendly.)
 
 ### Periodic runner (Task #7)
 

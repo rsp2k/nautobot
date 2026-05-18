@@ -2,7 +2,7 @@
 
 Public API::
 
-    from nautobot.core.tasks import get_task_backend, EnqueueOptions
+    from nautobot.core.task_backends import get_task_backend, EnqueueOptions
 
     backend = get_task_backend()
     backend.enqueue(...)
@@ -27,8 +27,8 @@ from .base import (
 )
 
 _BUILTIN_BACKENDS = {
-    "celery": "nautobot.core.tasks.celery_backend.CeleryBackend",
-    "procrastinate": "nautobot.core.tasks.procrastinate_backend.ProcrastinateBackend",
+    "celery": "nautobot.core.task_backends.celery_backend.CeleryBackend",
+    "procrastinate": "nautobot.core.task_backends.procrastinate_backend.ProcrastinateBackend",
 }
 
 
